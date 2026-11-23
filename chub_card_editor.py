@@ -100,33 +100,39 @@ def write_png_chunks(path: os.PathLike[str] | str, chunks: list[PngChunk]) -> No
     Path(path).write_bytes(payload)
 
 
-def _decode_possible_text(kind: bytes, data: bytes) -> tuple[str, str] | None:
+def _decode_card_text(chunk: PngChunk) -> tuple[str, str] | None:
+    kind, data = chunk.kind, chunk.data
+    if kind not in (b"tEXt", b"zTXt", b"iTXt"):
+        return None
+    # PNG text keywords occupy at most 79 bytes before their NUL separator.
+    end = data.find(b"\x00", 0, 80)
+    if end < 0:
+        return None
+    keyword = data[:end].decode("latin-1")
+    if keyword not in CARD_CHUNK_NAMES:
+        return None
+
     if kind == b"tEXt":
-        if b"\x00" not in data:
-            return None
-        keyword, text = data.split(b"\x00", 1)
-        return keyword.decode("latin-1"), text.decode("latin-1")
+        return keyword, data[end + 1 :].decode("latin-1")
 
     if kind == b"zTXt":
-        if b"\x00" not in data:
-            return None
-        keyword, rest = data.split(b"\x00", 1)
+        rest = data[end + 1 :]
         if not rest or rest[0] != 0:
             return None
-        return keyword.decode("latin-1"), zlib.decompress(rest[1:]).decode("utf-8")
+        return keyword, zlib.decompress(rest[1:]).decode("utf-8")
 
     if kind == b"iTXt":
         parts = data.split(b"\x00", 5)
         if len(parts) != 6:
             return None
-        keyword, compression_flag, compression_method, _language, _translated, text = parts
+        _, compression_flag, compression_method, _language, _translated, text = parts
         if compression_flag == b"\x00":
             text_bytes = text
         elif compression_flag == b"\x01" and compression_method == b"\x00":
             text_bytes = zlib.decompress(text)
         else:
             return None
-        return keyword.decode("latin-1"), text_bytes.decode("utf-8")
+        return keyword, text_bytes.decode("utf-8")
 
     return None
 
@@ -134,11 +140,9 @@ def _decode_possible_text(kind: bytes, data: bytes) -> tuple[str, str] | None:
 def _card_text_chunks(chunks: list[PngChunk]) -> dict[str, str]:
     found: dict[str, str] = {}
     for chunk in chunks:
-        decoded = _decode_possible_text(chunk.kind, chunk.data)
-        if decoded is None:
-            continue
-        keyword, text = decoded
-        if keyword in CARD_CHUNK_NAMES:
+        decoded = _decode_card_text(chunk)
+        if decoded is not None:
+            keyword, text = decoded
             found[keyword] = text
     return found
 
@@ -176,11 +180,6 @@ def load_card(path: os.PathLike[str] | str) -> LoadedCard:
     raise CardFormatError("No chub/SillyTavern card metadata found. Expected a 'ccv3' or 'chara' PNG text chunk.")
 
 
-def _chunk_keyword(chunk: PngChunk) -> str | None:
-    decoded = _decode_possible_text(chunk.kind, chunk.data)
-    return decoded[0] if decoded else None
-
-
 def _make_text_chunk(keyword: str, text: str) -> PngChunk:
     if not keyword or len(keyword) > 79:
         raise CardFormatError("PNG tEXt keyword length must be between 1 and 79 characters.")
@@ -205,7 +204,7 @@ def save_card_to_png(
     inserted = False
 
     for chunk in chunks:
-        if _chunk_keyword(chunk) in CARD_CHUNK_NAMES:
+        if _decode_card_text(chunk) is not None:
             continue
         if chunk.kind == b"IEND" and not inserted:
             output_chunks.append(new_chunk)
